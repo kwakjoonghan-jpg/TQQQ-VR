@@ -270,15 +270,16 @@ input:focus,select:focus{border-color:#2b3037!important;box-shadow:0 0 0 3px rgb
       </div>
       <label class="checkline"><input type="checkbox" id="sync-auto" onchange="saveSyncSettings(false)"> 기록 후 GitHub에 자동 저장</label>
       <div class="sync-row">
+        <button onclick="testGitHubToken()">토큰 확인</button>
         <button onclick="pushGist(true)">GitHub 저장</button>
-        <button onclick="pullGist()">GitHub 불러오기</button>
       </div>
       <div class="sync-row" style="margin-top:6px">
+        <button onclick="pullGist()">GitHub 불러오기</button>
         <button onclick="exportJson()">JSON 백업</button>
         <button onclick="document.getElementById('json-import').click()">JSON 복원</button>
       </div>
       <input type="file" id="json-import" accept="application/json,.json" style="display:none" onchange="importJsonFile(event)">
-      <div class="sync-status" id="sync-status">GitHub 기록은 DQ 앱 방식처럼 Gist JSON 파일에 상태값을 저장하는 구조입니다.</div>
+      <div class="sync-status" id="sync-status">GitHub Gist JSON 파일에 상태값을 저장합니다. 토큰은 Gist/JSON 백업에 절대 저장하지 않도록 보안 패치했습니다. 401이 뜨면 새 토큰을 만들고 Gists 권한을 Write로 설정하세요.</div>
     </div>
     </div>
   </div>
@@ -738,12 +739,20 @@ function applyState(d,rerender=true){
   sync={...sync,...(d.sync||{})};
   if(rerender){render(); hydrateCfgFields(); hydrateSyncFields();}
 }
-function getState(){return {version:'vr_mobile_v12',updatedAt:new Date().toISOString(),cfg,history,sync:{...sync,token:sync.token?sync.token:''}};}
+function getState(includeToken=true){
+  return {
+    version:'vr_mobile_v12',
+    updatedAt:new Date().toISOString(),
+    cfg,
+    history,
+    sync:{...sync,token:includeToken?(sync.token?sync.token:''):''}
+  };
+}
 async function save(opts={}){
   const state=getState();
   try{localStorage.setItem(SKEY,JSON.stringify(state));}catch(e){}
   try{if(window.storage) await window.storage.set(SKEY,JSON.stringify(state));}catch(e){}
-  if(opts.auto && sync.autoPush && sync.token) pushGist(false);
+  if(opts.auto && sync.autoPush && sync.token) autoSyncGist();
 }
 
 function buildBuy(shares,minV,pool){
@@ -1035,52 +1044,143 @@ function hydrateSyncFields(){
   Object.entries(ids).forEach(([id,val])=>{const el=document.getElementById(id); if(el && el.value!==val) el.value=val||'';});
   const auto=document.getElementById('sync-auto'); if(auto) auto.checked=!!sync.autoPush;
 }
-async function saveSyncSettings(doSave=true){
-  sync.gistId=document.getElementById('sync-gist')?.value.trim()||'';
-  sync.fileName=document.getElementById('sync-file')?.value.trim()||'tqqq-vr-state.json';
-  sync.token=document.getElementById('sync-token')?.value.trim()||'';
+function setSyncStatus(msg){const el=document.getElementById('sync-status'); if(el) el.textContent=msg;}
+function makeGitHubHeaders(withJson=false){
+  const h={
+    'Accept':'application/vnd.github+json',
+    'X-GitHub-Api-Version':'2022-11-28'
+  };
+  if(sync.token) h.Authorization='Bearer '+sync.token;
+  if(withJson) h['Content-Type']='application/json';
+  return h;
+}
+async function readGitHubError(res){
+  let raw='';
+  try{raw=await res.text();}catch(_){raw='';}
+  let msg=raw;
+  try{const j=JSON.parse(raw); msg=j.message||raw;}catch(_){ }
+  if(res.status===401) return '인증 실패(401): 토큰이 취소/만료되었거나 잘못 복사되었습니다. 새 GitHub Token을 만들고 Gists 권한을 Write로 설정한 뒤 다시 넣어주세요.';
+  if(res.status===403) return '권한 부족(403): 토큰에 gist 권한이 없거나 접근이 차단되었습니다.';
+  if(res.status===404) return 'Gist ID 오류(404): Gist ID가 틀렸거나 이 토큰으로 접근할 수 없습니다. 기존 Gist ID를 확인하거나 Gist ID를 비우고 새로 저장하세요.';
+  return `GitHub 오류(${res.status}): ${String(msg||raw).slice(0,180)}`;
+}
+function normalizeGistConfigFromUI(){
+  const clean = v => String(v||'').replace(/[\u200B-\u200D\uFEFF]/g,'').trim();
+  sync.gistId=clean(document.getElementById('sync-gist')?.value);
+  sync.fileName=clean(document.getElementById('sync-file')?.value)||'tqqq-vr-state.json';
+  sync.token=clean(document.getElementById('sync-token')?.value);
   sync.autoPush=!!document.getElementById('sync-auto')?.checked;
+  if(!sync.fileName.endsWith('.json')) sync.fileName='tqqq-vr-state.json';
+  const tokenEl=document.getElementById('sync-token');
+  if(tokenEl && tokenEl.value!==sync.token) tokenEl.value=sync.token;
+}
+async function saveSyncSettings(doSave=true){
+  normalizeGistConfigFromUI();
   if(doSave) await save();
 }
-function setSyncStatus(msg){const el=document.getElementById('sync-status'); if(el) el.textContent=msg;}
+async function testGitHubToken(){
+  await saveSyncSettings(false);
+  if(!sync.token){setSyncStatus('GitHub Token을 먼저 입력해주세요.');return false;}
+  try{
+    setSyncStatus('GitHub 토큰 확인 중...');
+    const res=await fetch('https://api.github.com/user',{headers:makeGitHubHeaders(false)});
+    if(!res.ok) throw new Error(await readGitHubError(res));
+    const user=await res.json();
+    setSyncStatus(`GitHub 인증 확인 완료: ${user.login||'사용자'} 계정으로 연결되었습니다.`);
+    return true;
+  }catch(e){setSyncStatus(String(e.message||e)); return false;}
+}
+function makeVRBackupData(extra={}){
+  return {
+    ...extra,
+    version:'tqqq-vr-dq-gist-v1',
+    app:'TQQQ VR',
+    cfg,
+    history,
+    sync:{...sync,token:''},
+    exportedAt:new Date().toISOString()
+  };
+}
+async function readVRGistBackup(){
+  const res=await fetch(`https://api.github.com/gists/${sync.gistId}`,{headers:makeGitHubHeaders(false)});
+  if(!res.ok) throw new Error(await readGitHubError(res));
+  const gist=await res.json();
+  const file=(gist.files&&gist.files[sync.fileName]) || Object.values(gist.files||{})[0];
+  let backup={};
+  if(file&&file.content){
+    try{backup=JSON.parse(file.content)||{};}catch{backup={};}
+  }
+  return {gist,backup};
+}
+async function writeVRGistBackup(data){
+  const body={
+    description:'TQQQ VR Backup',
+    public:false,
+    files:{[sync.fileName]:{content:JSON.stringify(data,null,2)}}
+  };
+  let url='https://api.github.com/gists';
+  let method='POST';
+  if(sync.gistId){url+='/'+sync.gistId; method='PATCH';}
+  const res=await fetch(url,{method,headers:makeGitHubHeaders(true),body:JSON.stringify(body)});
+  if(!res.ok) throw new Error(await readGitHubError(res));
+  return await res.json();
+}
+let _syncTimer=null;
+function autoSyncGist(){
+  if(!sync.token || !sync.autoPush) return;
+  clearTimeout(_syncTimer);
+  _syncTimer=setTimeout(()=>pushGist(false),3000);
+}
 async function pushGist(showAlert=false){
   await saveSyncSettings(false);
-  if(!sync.token){setSyncStatus('GitHub Token을 입력해야 저장할 수 있습니다.');return;}
-  const content=JSON.stringify(getState(),null,2);
-  const body={description:'TQQQ VR dashboard state',public:false,files:{[sync.fileName]:{content}}};
-  const url=sync.gistId?`https://api.github.com/gists/${sync.gistId}`:'https://api.github.com/gists';
-  const method=sync.gistId?'PATCH':'POST';
+  if(!sync.token){setSyncStatus('GitHub Token을 먼저 입력해주세요.');return;}
+  if(showAlert) setSyncStatus('GitHub 저장 중...');
+  let remoteBackup={};
+  if(sync.gistId){
+    try{
+      const got=await readVRGistBackup();
+      remoteBackup=got.backup||{};
+    }catch(e){
+      console.warn('기존 Gist 읽기 생략:',e);
+    }
+  }
+  const data=makeVRBackupData(remoteBackup);
   try{
-    const res=await fetch(url,{method,headers:{'Accept':'application/vnd.github+json','Authorization':'Bearer '+sync.token,'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!res.ok) throw new Error(await res.text());
-    const data=await res.json();
-    sync.gistId=data.id||sync.gistId;
-    await saveSyncSettings(true); hydrateSyncFields();
+    const saved=await writeVRGistBackup(data);
+    if(!sync.gistId){
+      sync.gistId=saved.id;
+      const gistEl=document.getElementById('sync-gist');
+      if(gistEl) gistEl.value=sync.gistId;
+    }
+    await saveSyncSettings(true);
+    hydrateSyncFields();
     setSyncStatus('GitHub 저장 완료: '+new Date().toLocaleString());
     if(showAlert) alert('GitHub Gist에 저장했습니다.');
-  }catch(e){setSyncStatus('GitHub 저장 실패: '+String(e.message||e).slice(0,160));}
+  }catch(e){
+    console.error(e);
+    setSyncStatus('GitHub 저장 실패: '+String(e.message||e));
+  }
 }
 async function pullGist(){
   await saveSyncSettings(false);
-  if(!sync.gistId){setSyncStatus('Gist ID를 입력해주세요.');return;}
+  if(!sync.token || !sync.gistId){setSyncStatus('GitHub Token과 Gist ID가 필요합니다. 새로 만들려면 Gist ID를 비우고 GitHub 저장을 누르세요.');return;}
+  setSyncStatus('GitHub 불러오는 중...');
   try{
-    const headers={'Accept':'application/vnd.github+json'};
-    if(sync.token) headers.Authorization='Bearer '+sync.token;
-    const res=await fetch(`https://api.github.com/gists/${sync.gistId}`,{headers});
-    if(!res.ok) throw new Error(await res.text());
-    const data=await res.json();
-    const file=data.files?.[sync.fileName] || Object.values(data.files||{})[0];
-    if(!file?.content) throw new Error('Gist 안에서 JSON 파일을 찾지 못했습니다.');
-    const state=JSON.parse(file.content);
-    const keepSync={...sync};
-    applyState(state,false);
-    sync={...keepSync,gistId:sync.gistId||data.id};
-    await save(); render(); hydrateCfgFields(); hydrateSyncFields();
+    const {gist,backup}=await readVRGistBackup();
+    if(!backup || (!backup.cfg && !backup.history)) throw new Error('Gist 안에서 TQQQ VR 백업 데이터를 찾지 못했습니다. 파일명을 확인해주세요.');
+    const keepSync={...sync,gistId:sync.gistId||gist.id};
+    applyState(backup,false);
+    sync={...keepSync,token:keepSync.token,fileName:keepSync.fileName,autoPush:keepSync.autoPush};
+    await save();
+    render(); hydrateCfgFields(); hydrateSyncFields();
     setSyncStatus('GitHub 불러오기 완료: '+new Date().toLocaleString());
-  }catch(e){setSyncStatus('GitHub 불러오기 실패: '+String(e.message||e).slice(0,160));}
+  }catch(e){
+    console.error(e);
+    setSyncStatus('GitHub 불러오기 실패: '+String(e.message||e));
+  }
 }
 function exportJson(){
-  const blob=new Blob([JSON.stringify(getState(),null,2)],{type:'application/json'});
+  const blob=new Blob([JSON.stringify(getState(false),null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a'); a.href=url; a.download='tqqq-vr-state-'+new Date().toISOString().slice(0,10)+'.json'; a.click();
   setTimeout(()=>URL.revokeObjectURL(url),500);
