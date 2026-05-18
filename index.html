@@ -200,10 +200,11 @@ input:focus,select:focus{border-color:#2b3037!important;box-shadow:0 0 0 3px rgb
 <div class="form-card">
   <div class="form-hdr">
     <span class="fht" id="form-title"><i class="ti ti-pencil" aria-hidden="true" style="font-size:13px;vertical-align:-1px;margin-right:4px"></i>회차 마감 기록</span>
-    <span style="font-size:11px;color:var(--color-text-tertiary)">기준 종가일 자동 표시</span>
+    <span style="font-size:11px;color:var(--color-text-tertiary)">날짜 직접 입력 가능</span>
   </div>
   <div class="form-body">
     <div class="form-fields">
+      <div class="field"><label>기록 날짜</label><input type="date" id="inp-date" onchange="updatePreview()"></div>
       <div class="field"><label>직전 종가 ($)</label><input type="number" id="inp-price" step="0.01" placeholder="78.50" oninput="updatePreview()"></div>
       <div class="field"><label>거래 총액 ($)</label><input type="number" id="inp-trade" step="0.01" placeholder="체결내역 기준 자동" oninput="updatePreview()"></div>
       <div class="field"><label>현재 보유 주수</label><input type="number" id="inp-shares" placeholder="체결내역 기준 자동" oninput="updatePreview()"></div>
@@ -384,13 +385,15 @@ const FIXED_G = 11;
 const getG = _i => FIXED_G;
 const fmt = (n,d=2) => '$'+(Number(n)||0).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
 const pct = r => (r>=0?'+':'')+((Number(r)||0)*100).toFixed(1)+'%';
-const toISO = d => d.toISOString().slice(0,10);
-
 function parseISO(s){
   const [y,m,d]=String(s).split('-').map(Number);
   return new Date(y,m-1,d);
 }
 function addDays(date,days){const d=new Date(date); d.setDate(d.getDate()+days); return d;}
+function toISO(date){
+  const d=new Date(date);
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 function prevWeekday(date,weekday){
   const d=new Date(date);
   let diff=(d.getDay()-weekday+7)%7;
@@ -447,6 +450,14 @@ function getNext(baseRec){
   return {ni,G,V,pool,shares:last.shares,price:last.price,roi,dates,last};
 }
 
+function getFormBaseNext(){
+  // 신규 기록은 마지막 회차를 기준으로, 수정 중에는 '수정 대상 회차의 직전 회차'를 기준으로 계산합니다.
+  // 기존 버전은 수정 중에도 최신 마지막 회차를 기준으로 체결내역을 다시 더해서
+  // 수정 저장을 누를 때마다 보유 주식수가 누적 변경되는 문제가 있었습니다.
+  if(editingCycleIdx>=0) return getNext(getBefore(editingCycleIdx));
+  return getNext();
+}
+
 function showMainTab(tab){
   ['dash','trade','report','settings'].forEach(t=>{
     const panel=document.getElementById('panel-'+t);
@@ -468,7 +479,7 @@ function getFillSummary(fills=currentFills,baseShares=getNext().shares){
   return {net,delta,sharesAfter:baseShares+delta,buyAmt,sellAmt,buyQty,sellQty,count:fills.length};
 }
 function syncFillInputs(){
-  const np=getNext();
+  const np=getFormBaseNext();
   const sum=getFillSummary(currentFills,np.shares);
   if(currentFills.length){
     const t=document.getElementById('inp-trade'); if(t) t.value=sum.net.toFixed(2);
@@ -841,6 +852,7 @@ function render(){
   renderChart(np);
   renderHistory();
   document.getElementById('inp-v').placeholder=fmt(np.V,2).replace('$','')+' (자동)';
+  if(editingCycleIdx<0) setTradeDateDefault(false);
   syncFillInputs();
   updatePreview();
   if(document.getElementById('panel-report')?.classList.contains('active')) renderReport();
@@ -915,8 +927,20 @@ function renderHistory(){
   });
 }
 
-function updatePreview(){
+function setTradeDateDefault(force=false){
+  const el=document.getElementById('inp-date');
+  if(!el) return;
   const np=getNext();
+  if(force || !el.value) el.value=np.dates.cycleISO;
+}
+
+function getTradeDateValue(fallbackDate){
+  const v=document.getElementById('inp-date')?.value;
+  return v || fallbackDate || getNext().dates.cycleISO;
+}
+
+function updatePreview(){
+  const np=getFormBaseNext();
   if(currentFills.length) syncFillInputs();
   const price=parseFloat(document.getElementById('inp-price').value)||np.price;
   const fillSum=getFillSummary(currentFills,np.shares);
@@ -939,43 +963,44 @@ function updatePreview(){
 
 async function submitCycle(){
   const price=parseFloat(document.getElementById('inp-price').value);
-  const np0=getNext();
-  const fillSum=getFillSummary(currentFills,np0.shares);
+  const isEditing=editingCycleIdx>=0;
+  const baseNext=isEditing?getNext(getBefore(editingCycleIdx)):getNext();
+  const fillSum=getFillSummary(currentFills,baseNext.shares);
   const tradeNet=currentFills.length?fillSum.net:(parseFloat(document.getElementById('inp-trade').value)||0);
   const shares=currentFills.length?fillSum.sharesAfter:parseInt(document.getElementById('inp-shares').value);
   const vOv=parseFloat(document.getElementById('inp-v').value)||0;
+  const recDate=getTradeDateValue(baseNext.dates.cycleISO);
+  if(!recDate){alert('기록 날짜를 입력해주세요.');return;}
   if(!price||!shares){alert('종가와 보유 주수는 필수입니다. 체결내역을 입력하면 보유 주수는 자동 계산됩니다.');return;}
-  if(round2(np0.pool+tradeNet)<0 && !confirm('거래 후 Pool이 음수입니다. 그래도 저장할까요?')) return;
+  if(round2(baseNext.pool+tradeNet)<0 && !confirm('거래 후 Pool이 음수입니다. 그래도 저장할까요?')) return;
 
   let targetJustReached=false;
-  if(editingCycleIdx>=0){
-    const prev=getBefore(editingCycleIdx);
-    const expected=getNext(prev);
+  if(isEditing){
     const idx=history.findIndex(h=>h.i===editingCycleIdx);
     if(idx>=0){
-      const thisV=vOv||expected.V;
-      const poolAfter=round2(expected.pool+tradeNet);
+      const thisV=vOv||baseNext.V;
+      const poolAfter=round2(baseNext.pool+tradeNet);
       const evalAmt=round2(shares*price);
       const principal=(editingCycleIdx+1)*cfg.deposit;
       const roi=(evalAmt+poolAfter-principal)/principal;
-      const rec={...history[idx],p:price,t:tradeNet,s:shares,V:thisV,pl:poolAfter,G:expected.G,r:roi,e:evalAmt,fills:[...currentFills]};
+      const rec={...history[idx],d:recDate,date:recDate,p:price,t:tradeNet,s:shares,V:thisV,pl:poolAfter,G:baseNext.G,r:roi,e:evalAmt,fills:[...currentFills],isUser:true};
       history[idx]=rec;
       targetJustReached=markTargetAchievement(rec);
     }
     cancelEdit(false);
   } else {
-    const np=getNext();
+    const np=baseNext;
     if(history.some(h=>h.i===np.ni)){alert(np.ni+'회차 기록이 이미 있습니다. 기존 기록을 수정해주세요.');return;}
     const thisV=vOv||np.V;
     const poolAfter=round2(np.pool+tradeNet);
     const evalAmt=round2(shares*price);
     const principal=(np.ni+1)*cfg.deposit;
     const roi=(evalAmt+poolAfter-principal)/principal;
-    const rec={i:np.ni,d:np.dates.cycleISO,p:price,t:tradeNet,s:shares,V:thisV,pl:poolAfter,G:np.G,r:roi,e:evalAmt,fills:[...currentFills],isUser:true};
+    const rec={i:np.ni,d:recDate,date:recDate,p:price,t:tradeNet,s:shares,V:thisV,pl:poolAfter,G:np.G,r:roi,e:evalAmt,fills:[...currentFills],isUser:true};
     history.push(rec);
     targetJustReached=markTargetAchievement(rec);
   }
-  ['inp-price','inp-trade','inp-shares','inp-v'].forEach(id=>document.getElementById(id).value='');
+  ['inp-date','inp-price','inp-trade','inp-shares','inp-v'].forEach(id=>document.getElementById(id).value='');
   clearFills();
   await save({auto:true}); render();
   if(targetJustReached) setTimeout(()=>showTargetModal(false),250);
@@ -985,6 +1010,7 @@ function startEdit(idx){
   const rec=history.find(h=>h.i===idx);
   if(!rec){alert('앱에서 추가한 기록만 수정할 수 있습니다.');return;}
   editingCycleIdx=idx;
+  document.getElementById('inp-date').value=rec.d||rec.date||'';
   document.getElementById('inp-price').value=rec.p;
   document.getElementById('inp-trade').value=rec.t;
   document.getElementById('inp-shares').value=rec.s;
@@ -999,7 +1025,7 @@ function startEdit(idx){
 }
 function cancelEdit(doRender=true){
   editingCycleIdx=-1;
-  ['inp-price','inp-trade','inp-shares','inp-v'].forEach(id=>document.getElementById(id).value='');
+  ['inp-date','inp-price','inp-trade','inp-shares','inp-v'].forEach(id=>document.getElementById(id).value='');
   clearFills();
   document.getElementById('form-title').innerHTML='<i class="ti ti-pencil" aria-hidden="true" style="font-size:13px;vertical-align:-1px;margin-right:4px"></i>회차 마감 기록';
   document.getElementById('submit-label').textContent='기록하기';
