@@ -819,6 +819,7 @@ function render(){
   const np=getNext();
   const last=np.last;
   const minV=round2(np.V*cfg.buyBand), maxV=round2(np.V*cfg.sellBand);
+  const nextRecordPack=getDatePack(np.dates.cycleISO); // 현재 운영 회차의 다음 회차 기록 기준일
 
   document.getElementById('s-cycle').textContent=np.ni+'회차';
   document.getElementById('s-date').textContent=koDate(np.dates.cycleDate)+' 주문';
@@ -837,7 +838,7 @@ function render(){
   document.getElementById('adj-cur').textContent=fmt(last.pool,2);
 
   document.getElementById('basis-title').textContent=np.ni+'회차 운영 기준';
-  document.getElementById('basis-cycle').textContent='다음 기록일 '+koDate(np.dates.cycleDate);
+  document.getElementById('basis-cycle').textContent='다음 기록일 '+koDate(nextRecordPack.reviewDate);
   document.getElementById('basis-close').textContent=koDate(np.dates.closeDate)+' 종가 입력';
   document.getElementById('basis-review').textContent=koDate(np.dates.reviewDate)+' 주문표 점검';
   document.getElementById('basis-order').textContent=koDate(np.dates.cycleDate)+' 장 시작 전 지정가 예약';
